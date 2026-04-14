@@ -5,11 +5,14 @@ Train a Plan-Critic from scratch using only outcome reward (EM/F1).
 The Critic learns to Accept/Reject Planner output; its reward is derived
 entirely from whether the final multi-hop answer is correct.
 
-Single-GPU version:
+Single-GPU optimized version:
     - No split-card setup
     - vLLM QA model, Planner, and Critic all use the same GPU
     - No separately loaded ref model; reference log-prob is computed by
       temporarily disabling the Critic's LoRA adapter
+    - Critic group sampling is batched in one generate() call
+    - GRPO log-prob computation is batched across the whole group
+    - Training loop avoids per-step loss.item() GPU sync
 """
 
 import json
@@ -20,6 +23,8 @@ import argparse
 import atexit
 import multiprocessing as mp
 import random
+import hashlib
+import pickle
 from collections import defaultdict
 
 import torch
@@ -149,6 +154,18 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="./critic_lora_grpo")
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument(
+        "--stop_stage_after_pass",
+        action="store_true",
+        default=True,
+        help="Check stage threshold after each epoch and stop that stage as soon as it passes.",
+    )
+    p.add_argument(
+        "--disable_stop_stage_after_pass",
+        action="store_false",
+        dest="stop_stage_after_pass",
+        help="Force the old behavior: always run all epochs inside each stage attempt.",
+    )
+    p.add_argument(
         "--batch_size",
         type=int,
         default=4,
@@ -161,8 +178,20 @@ def parse_args():
         help="Sampling temperature for GRPO group sampling",
     )
     p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--save_every", type=int, default=200)
-    p.add_argument("--log_every", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1000)
+    p.add_argument("--log_every", type=int, default=50)
+    p.add_argument(
+        "--planner_cache_path",
+        type=str,
+        default=None,
+        help="Persistent planner cache path. Defaults to <output_dir>/planner_cache.pkl",
+    )
+    p.add_argument(
+        "--qa_cache_path",
+        type=str,
+        default=None,
+        help="Persistent QA-result cache path. Defaults to <output_dir>/qa_cache.pkl",
+    )
     p.add_argument(
         "--gpu_id",
         type=int,
@@ -194,6 +223,45 @@ def normalize_feedback(feedback: str | None):
     if feedback is None:
         return None
     return " ".join(feedback.strip().split())
+
+
+def stable_hash(payload) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def planner_cache_key(question: str, feedback: str | None) -> str:
+    return stable_hash({"question": question, "feedback": normalize_feedback(feedback)})
+
+
+def agent_loop_cache_key(question: str, final_plan: list, context: str) -> str:
+    return stable_hash({"question": question, "final_plan": final_plan, "context": context})
+
+
+def critic_prompt_cache_key(question: str, plan: list) -> str:
+    return stable_hash({"question": question, "plan": plan})
+
+
+def load_pickle_cache(path: str) -> dict:
+    if path is None or (not os.path.exists(path)):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        if isinstance(obj, dict):
+            return obj
+    except Exception as exc:
+        print(f"Warning: failed to load cache {path}: {exc}")
+    return {}
+
+
+def save_pickle_cache(cache: dict, path: str):
+    if path is None:
+        return
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -476,7 +544,7 @@ def parse_critic_output(text: str):
 # ─────────────────────────────────────────────────────────────
 #  Planner inference (one question at a time, greedy)
 # ─────────────────────────────────────────────────────────────
-@torch.no_grad()
+@torch.inference_mode()
 def planner_decompose(question: str, planner_model, planner_tok, feedback: str = None) -> list:
     user_content = f"Decompose:\n{question}"
     if feedback:
@@ -606,35 +674,42 @@ def sample_critic_responses(
 
     do_sample = temperature is not None and temperature > 0.0
 
-    for _ in range(num_samples):
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "pad_token_id": critic_tok.pad_token_id,
-            "return_dict_in_generate": True,
-            "output_scores": False,
-        }
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": critic_tok.pad_token_id,
+        "return_dict_in_generate": True,
+        "output_scores": False,
+    }
 
-        if do_sample:
-            gen_kwargs["do_sample"] = True
-            gen_kwargs["temperature"] = temperature
-            gen_kwargs["top_p"] = 0.9
-        else:
-            gen_kwargs["do_sample"] = False
+    if do_sample:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = 0.9
+    else:
+        gen_kwargs["do_sample"] = False
 
-        with torch.no_grad():
-            out = critic_model.generate(
-                **enc,
-                **gen_kwargs,
-            )
+    batched_enc = {}
+    for key, value in enc.items():
+        batched_enc[key] = value.repeat(num_samples, 1)
 
-        response_ids = out.sequences[0][input_len:]
+    shared_input_ids = enc["input_ids"].clone()
+    shared_attention_mask = enc["attention_mask"].clone()
+
+    with torch.inference_mode():
+        out = critic_model.generate(
+            **batched_enc,
+            **gen_kwargs,
+        )
+
+    for sequence in out.sequences:
+        response_ids = sequence[input_len:]
         text = critic_tok.decode(response_ids, skip_special_tokens=True).strip()
 
         results.append(
             {
                 "text": text,
-                "input_ids": enc["input_ids"].clone(),
-                "attention_mask": enc["attention_mask"].clone(),
+                "input_ids": shared_input_ids,
+                "attention_mask": shared_attention_mask,
                 "response_ids": response_ids.clone(),
             }
         )
@@ -668,14 +743,17 @@ def _forward_for_logprob(model, full_ids, full_attention_mask, use_base_without_
 
 
 
-def compute_response_logprob(
+def compute_batched_response_logprobs(
     model,
     input_ids,
     attention_mask,
-    response_ids,
+    response_ids_list,
     use_base_without_adapter: bool = False,
 ):
     model_device = get_model_device(model)
+
+    if len(response_ids_list) == 0:
+        return torch.empty(0, device=model_device, dtype=torch.float32)
 
     input_ids = input_ids.to(model_device)
 
@@ -684,14 +762,47 @@ def compute_response_logprob(
     else:
         attention_mask = attention_mask.to(model_device)
 
-    if response_ids.dim() == 1:
-        response_ids = response_ids.unsqueeze(0)
-    response_ids = response_ids.to(model_device)
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    if attention_mask.dim() == 1:
+        attention_mask = attention_mask.unsqueeze(0)
 
-    full_ids = torch.cat([input_ids, response_ids], dim=1)
+    batch_size = len(response_ids_list)
+    prompt_ids = input_ids.expand(batch_size, -1)
+    prompt_attention_mask = attention_mask.expand(batch_size, -1)
 
-    response_attention_mask = torch.ones_like(response_ids, device=model_device)
-    full_attention_mask = torch.cat([attention_mask, response_attention_mask], dim=1)
+    response_lengths = []
+    for response_ids in response_ids_list:
+        response_lengths.append(int(response_ids.numel()))
+
+    max_response_len = max(response_lengths)
+
+    pad_token_id = getattr(model.config, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(model.config, "eos_token_id", 0)
+
+    response_batch = torch.full(
+        (batch_size, max_response_len),
+        fill_value=pad_token_id,
+        dtype=prompt_ids.dtype,
+        device=model_device,
+    )
+    response_attention_mask = torch.zeros(
+        (batch_size, max_response_len),
+        dtype=prompt_attention_mask.dtype,
+        device=model_device,
+    )
+
+    for idx, response_ids in enumerate(response_ids_list):
+        response_ids = response_ids.to(model_device).view(-1)
+        cur_len = response_ids.numel()
+        if cur_len == 0:
+            continue
+        response_batch[idx, :cur_len] = response_ids
+        response_attention_mask[idx, :cur_len] = 1
+
+    full_ids = torch.cat([prompt_ids, response_batch], dim=1)
+    full_attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
 
     outputs = _forward_for_logprob(
         model,
@@ -700,17 +811,17 @@ def compute_response_logprob(
         use_base_without_adapter=use_base_without_adapter,
     )
 
-    prompt_len = input_ids.shape[1]
-
-    logits = outputs.logits[:, prompt_len - 1 : -1, :]
+    prompt_len = prompt_ids.shape[1]
+    logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + max_response_len, :]
     log_probs = F.log_softmax(logits, dim=-1)
 
     token_log_probs = log_probs.gather(
         dim=-1,
-        index=response_ids.unsqueeze(-1),
+        index=response_batch.unsqueeze(-1),
     ).squeeze(-1)
 
-    return token_log_probs.sum()
+    token_log_probs = token_log_probs * response_attention_mask.to(token_log_probs.dtype)
+    return token_log_probs.sum(dim=1)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -729,44 +840,24 @@ def grpo_loss(
     std_r = rewards_t.std(unbiased=False)
     advantages = (rewards_t - mean_r) / (std_r + 1e-8)
 
-    total_loss = None
-    valid_count = 0
+    valid_response_ids = []
+    valid_advantages = []
+    prompt_input_ids = None
+    prompt_attention_mask = None
 
     for sample, adv in zip(samples, advantages):
         response_ids = sample["response_ids"]
         if response_ids.numel() == 0:
             continue
 
-        sum_log_prob = compute_response_logprob(
-            critic_model,
-            sample["input_ids"],
-            sample["attention_mask"],
-            response_ids,
-            use_base_without_adapter=False,
-        )
+        if prompt_input_ids is None:
+            prompt_input_ids = sample["input_ids"]
+            prompt_attention_mask = sample["attention_mask"]
 
-        with torch.no_grad():
-            ref_sum_log_prob = compute_response_logprob(
-                critic_model,
-                sample["input_ids"],
-                sample["attention_mask"],
-                response_ids,
-                use_base_without_adapter=True,
-            )
+        valid_response_ids.append(response_ids)
+        valid_advantages.append(adv)
 
-        kl = sum_log_prob - ref_sum_log_prob.to(sum_log_prob.device)
-
-        pg_loss = -adv * sum_log_prob
-        sample_loss = pg_loss + kl_coef * kl
-
-        if total_loss is None:
-            total_loss = sample_loss
-        else:
-            total_loss = total_loss + sample_loss
-
-        valid_count += 1
-
-    if valid_count == 0:
+    if len(valid_response_ids) == 0:
         dummy = None
         for p in critic_model.parameters():
             if p.requires_grad:
@@ -776,7 +867,28 @@ def grpo_loss(
             raise RuntimeError("No trainable parameters found in critic_model.")
         return dummy.sum() * 0.0
 
-    return total_loss / valid_count
+    sum_log_probs = compute_batched_response_logprobs(
+        critic_model,
+        prompt_input_ids,
+        prompt_attention_mask,
+        valid_response_ids,
+        use_base_without_adapter=False,
+    )
+
+    with torch.no_grad():
+        ref_sum_log_probs = compute_batched_response_logprobs(
+            critic_model,
+            prompt_input_ids,
+            prompt_attention_mask,
+            valid_response_ids,
+            use_base_without_adapter=True,
+        )
+
+    valid_advantages_t = torch.stack(valid_advantages).to(critic_device)
+    kl = sum_log_probs - ref_sum_log_probs.to(sum_log_probs.device)
+    pg_loss = -valid_advantages_t * sum_log_probs
+    sample_losses = pg_loss + kl_coef * kl
+    return sample_losses.mean()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -795,19 +907,20 @@ def train_one_stage(
     scheduler,
     args,
     global_step: int,
+    planner_cache: dict,
+    agent_loop_cache: dict,
+    critic_prompt_cache: dict,
 ):
     random.shuffle(stage_data)
 
     log_stats = defaultdict(list)
-    batch_loss_acc = 0.0
-    optimizer.zero_grad()
+    batch_loss_acc = None
+    optimizer.zero_grad(set_to_none=True)
 
-    planner_cache = {}
     critic_review_cache = {}
-    agent_loop_cache = {}
 
     def cached_planner(question, feedback=None):
-        key = (question, normalize_feedback(feedback))
+        key = planner_cache_key(question, feedback)
         if key not in planner_cache:
             planner_cache[key] = planner_decompose(
                 question,
@@ -832,7 +945,7 @@ def train_one_stage(
         return critic_review_cache[prompt]
 
     def cached_agent_loop(question, final_plan, context):
-        key = (question, tuple(final_plan), context)
+        key = agent_loop_cache_key(question, final_plan, context)
         if key not in agent_loop_cache:
             agent_loop_cache[key] = run_agent_loop(
                 question,
@@ -846,7 +959,7 @@ def train_one_stage(
     for sample_idx, data in enumerate(tqdm(stage_data, desc=f"  Stage {stage_id} training")):
         question = data["question"]
         ground_truth = data["answer"]
-        context = "\n\n---\n\n".join(data["pred_texts"])
+        context = data["context_str"]
 
         # Step 1: Planner → initial plan
         initial_plan = cached_planner(question)
@@ -854,7 +967,10 @@ def train_one_stage(
             continue
 
         # Step 2: Build critic prompt
-        critic_prompt = build_critic_prompt(question, initial_plan, critic_tok)
+        prompt_key = critic_prompt_cache_key(question, initial_plan)
+        if prompt_key not in critic_prompt_cache:
+            critic_prompt_cache[prompt_key] = build_critic_prompt(question, initial_plan, critic_tok)
+        critic_prompt = critic_prompt_cache[prompt_key]
 
         # Step 3: Sample G critic responses
         critic_model.train()
@@ -899,7 +1015,12 @@ def train_one_stage(
         )
         loss = loss / args.batch_size
         loss.backward()
-        batch_loss_acc += float(loss.item())
+
+        detached_loss = loss.detach()
+        if batch_loss_acc is None:
+            batch_loss_acc = detached_loss
+        else:
+            batch_loss_acc = batch_loss_acc + detached_loss
 
         # Step 6: Gradient update
         if (sample_idx + 1) % args.batch_size == 0:
@@ -909,7 +1030,7 @@ def train_one_stage(
             )
             optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
             if global_step % args.log_every == 0:
@@ -919,12 +1040,13 @@ def train_one_stage(
                 avg_rew = sum(log_stats["reward"][-window:]) / max(len(log_stats["reward"][-window:]), 1)
                 acc_rate = sum(log_stats["verdict"][-window:]) / max(len(log_stats["verdict"][-window:]), 1)
 
+                loss_value = 0.0 if batch_loss_acc is None else float(batch_loss_acc.item())
                 print(
-                    f"    Step {global_step:5d} | loss={batch_loss_acc:.4f} | "
+                    f"    Step {global_step:5d} | loss={loss_value:.4f} | "
                     f"EM={avg_em:.3f}  F1={avg_f1:.3f} | "
                     f"reward={avg_rew:.3f} | accept_rate={acc_rate:.2f}"
                 )
-                batch_loss_acc = 0.0
+                batch_loss_acc = None
 
             if global_step % args.save_every == 0:
                 ckpt = os.path.join(args.output_dir, f"stage{stage_id}_step{global_step}")
@@ -948,6 +1070,13 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available.")
     if torch.cuda.device_count() < 1:
@@ -964,10 +1093,20 @@ def main():
         for line in f:
             d = json.loads(line)
             s = d.get("curriculum_stage", 1)
+            d["context_str"] = "\n\n---\n\n".join(d["pred_texts"])
             stage_data[s].append(d)
 
     for s in sorted(stage_data):
         print(f"  Stage {s}: {len(stage_data[s])} samples")
+
+    planner_cache_path = args.planner_cache_path or os.path.join(args.output_dir, "planner_cache.pkl")
+    qa_cache_path = args.qa_cache_path or os.path.join(args.output_dir, "qa_cache.pkl")
+    planner_cache = load_pickle_cache(planner_cache_path)
+    agent_loop_cache = load_pickle_cache(qa_cache_path)
+    critic_prompt_cache = {}
+
+    print(f"Loaded planner cache: {len(planner_cache)} entries")
+    print(f"Loaded QA cache: {len(agent_loop_cache)} entries")
 
     # ── Step 1: vLLM on same GPU ─────────────────────────────
     print(f"\n[1/3] Loading QA model via vLLM on GPU{args.gpu_id} ...")
@@ -1000,6 +1139,7 @@ def main():
         device_map={"": args.gpu_id},
         low_cpu_mem_usage=True,
         trust_remote_code=True,
+        attn_implementation="sdpa",
     )
     planner_model = PeftModel.from_pretrained(planner_base_model, args.planner_lora)
     planner_model.eval()
@@ -1019,6 +1159,7 @@ def main():
         device_map={"": args.gpu_id},
         low_cpu_mem_usage=True,
         trust_remote_code=True,
+        attn_implementation="sdpa",
     )
     lora_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -1090,7 +1231,20 @@ def main():
                     scheduler=scheduler,
                     args=args,
                     global_step=global_step,
+                    planner_cache=planner_cache,
+                    agent_loop_cache=agent_loop_cache,
+                    critic_prompt_cache=critic_prompt_cache,
                 )
+
+                save_pickle_cache(planner_cache, planner_cache_path)
+                save_pickle_cache(agent_loop_cache, qa_cache_path)
+
+                em_ok = metrics["EM"] >= threshold["EM"]
+                f1_ok = metrics["F1"] >= threshold["F1"]
+                passed = em_ok and f1_ok
+                if passed and args.stop_stage_after_pass:
+                    print(f"\n  Stage {stage_id} passed after epoch {epoch + 1}; stopping remaining epochs for this attempt.")
+                    break
 
             em_ok = metrics["EM"] >= threshold["EM"]
             f1_ok = metrics["F1"] >= threshold["F1"]
@@ -1123,6 +1277,8 @@ def main():
             )
             critic_model.save_pretrained(stage_ckpt)
             critic_tok.save_pretrained(stage_ckpt)
+            save_pickle_cache(planner_cache, planner_cache_path)
+            save_pickle_cache(agent_loop_cache, qa_cache_path)
             print(f"  Checkpoint saved → {stage_ckpt}")
 
             retrain_ct += 1
@@ -1137,6 +1293,8 @@ def main():
     final_dir = os.path.join(args.output_dir, "final")
     critic_model.save_pretrained(final_dir)
     critic_tok.save_pretrained(final_dir)
+    save_pickle_cache(planner_cache, planner_cache_path)
+    save_pickle_cache(agent_loop_cache, qa_cache_path)
 
     # ── Training summary ──────────────────────────────────────
     print("\n" + "=" * 55)
